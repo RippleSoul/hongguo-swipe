@@ -1,0 +1,11 @@
+build/
+.local-signing.p12
+*.p12
+*.jks
+*.keystore
+*.apk
+*.idsig
+__pycache__/
+local.properties
+.DS_Store
+validation.md
