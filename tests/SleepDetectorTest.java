@@ -8,7 +8,7 @@ public final class SleepDetectorTest {
         for (long t = from; t <= through; t += 200) detector.acceleration(t, x, 0, 9.81f);
     }
     public static void main(String[] args) {
-        long duration = 300000;
+        long duration = 900000;
         SleepDetector detector = new SleepDetector();
         check(detector.remaining(0, duration) == duration, "No samples must not imply stillness");
         still(detector, 0, duration - 200, 0);

@@ -40,7 +40,7 @@ public class MainActivity extends Activity {
     private static final int MUTED = 0xff777e80, SOFT = 0xfff1eeea, ROSE = 0xffffe9e3;
     private final Handler handler = new Handler(Looper.getMainLooper());
     private FrameLayout root, drawer, panel, content;
-    private TextView title, status, explanation, durationLabel;
+    private TextView title, status, durationLabel;
     private PowerButton home;
     private Button timerChoice, autoChoice, start, cancel;
     private Button[] presets;
@@ -63,11 +63,11 @@ public class MainActivity extends Activity {
         selectedMode = prefs.getInt("choice", SleepController.TIMER);
         if (prefs.getInt("mode", 0) != 0) selectedMode = prefs.getInt("mode", SleepController.TIMER);
         minuteValue = prefs.getInt("minutes", 30); secondValue = prefs.getInt("seconds", 0);
-        automaticValue = prefs.getInt("auto_minutes", 15);
+        automaticValue = Math.max(15, prefs.getInt("auto_minutes", 15));
         if (saved != null) {
             sleepPage = saved.getBoolean("page"); selectedMode = saved.getInt("choice", selectedMode);
             minuteValue = saved.getInt("minutes", minuteValue); secondValue = saved.getInt("seconds", secondValue);
-            automaticValue = saved.getInt("auto_minutes", automaticValue);
+            automaticValue = Math.max(15, saved.getInt("auto_minutes", automaticValue));
             pendingMode = saved.getInt("pending"); pendingDuration = saved.getLong("pending_duration");
             pendingUntil = saved.getLong("pending_until");
         }
@@ -215,9 +215,7 @@ public class MainActivity extends Activity {
                 }
             });
         }
-        explanation = text("", 14, MUTED); explanation.setLineSpacing(dp(3), 1);
-        LinearLayout.LayoutParams note = new LinearLayout.LayoutParams(-1, -2); note.topMargin = dp(20); note.bottomMargin = dp(24);
-        column.addView(explanation, note);
+        View space = new View(this); column.addView(space, new LinearLayout.LayoutParams(1, dp(28)));
         start = action("开启睡眠", RED, Color.WHITE);
         column.addView(start, new LinearLayout.LayoutParams(-1, dp(56)));
         start.setOnClickListener(new View.OnClickListener() { @Override public void onClick(View v) { startSleep(); } });
@@ -240,11 +238,9 @@ public class MainActivity extends Activity {
         style(autoChoice, automatic ? RED : 0, automatic ? Color.WHITE : INK, 24);
         timeRow.setVisibility(automatic ? View.GONE : View.VISIBLE); autoRow.setVisibility(automatic ? View.VISIBLE : View.GONE);
         durationLabel.setText(automatic ? "持续少动多久后关闭" : "多久后关闭");
-        explanation.setText(automatic ? "亮屏看红果时，根据手机持续少动推测入睡。安静看剧也可能误触发。"
-                : "到时结束红果播放，并关闭手机屏幕。");
         prefs.edit().putInt("choice", mode).apply(); updatePresets(); update();
     }
-    private int[] presetValues() { return selectedMode == SleepController.AUTO ? new int[]{5,15,30} : new int[]{15,30,60}; }
+    private int[] presetValues() { return new int[]{15,30,60}; }
     private void updatePresets() {
         if (presets == null) return;
         int[] values = presetValues(); int value = selectedMode == SleepController.AUTO ? read(autoMinutes) : read(minutes);
@@ -258,7 +254,7 @@ public class MainActivity extends Activity {
         hideKeyboard(); long duration;
         if (selectedMode == SleepController.AUTO) {
             int value = read(autoMinutes);
-            if (value < 5 || value > 120) { toast("自动检测请设置 5 到 120 分钟"); return; }
+            if (value < 15 || value > 120) { toast("自动检测请设置 15 到 120 分钟"); return; }
             duration = value * 60000L;
         } else {
             int m = read(minutes), s = read(seconds);
@@ -278,7 +274,7 @@ public class MainActivity extends Activity {
         int m = read(minutes), s = read(seconds), a = read(autoMinutes);
         if (m >= 0 && m <= 720) minuteValue = m;
         if (s >= 0 && s <= 59) secondValue = s;
-        if (a >= 5 && a <= 120) automaticValue = a;
+        if (a >= 15 && a <= 120) automaticValue = a;
         prefs.edit().putInt("minutes", minuteValue).putInt("seconds", secondValue).putInt("auto_minutes", automaticValue).apply();
     }
     private void update() {

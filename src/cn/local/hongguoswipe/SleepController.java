@@ -17,6 +17,7 @@ import java.util.Locale;
 /** Owned by the accessibility service; no overlay, network or repeating timer poll. */
 final class SleepController implements SensorEventListener {
     static final int OFF = 0, TIMER = 1, AUTO = 2;
+    static final long MIN_AUTO_DURATION = 15 * 60 * 1000L;
     static final long MAX_DURATION = 12 * 60 * 60 * 1000L;
     private final SwipeService service;
     private final Handler handler;
@@ -48,6 +49,7 @@ final class SleepController implements SensorEventListener {
                 || (savedMode == TIMER && (savedDeadline <= now() || savedDeadline - now() > savedDuration))) {
             cancel(); message = "上次睡眠任务已结束"; return;
         }
+        if (savedMode == AUTO && savedDuration < MIN_AUTO_DURATION) { cancel(); return; }
         if (savedMode == AUTO && !supportsAuto()) { cancel(); message = "传感器不可用，请使用倒计时"; return; }
         if (Build.VERSION.SDK_INT < 28 || (savedMode != TIMER && savedMode != AUTO)) { cancel(); return; }
         mode = savedMode; duration = savedDuration; deadline = savedDeadline;
@@ -59,7 +61,7 @@ final class SleepController implements SensorEventListener {
         if (Build.VERSION.SDK_INT < 28) return "睡眠锁屏需要 Android 9 或以上";
         if (requestedMode != TIMER && requestedMode != AUTO) return "请选择睡眠方式";
         if (requestedDuration < 1000 || requestedDuration > MAX_DURATION) return "请设置 1 秒到 12 小时";
-        if (requestedMode == AUTO && requestedDuration < 5 * 60 * 1000L) return "自动检测至少持续 5 分钟";
+        if (requestedMode == AUTO && requestedDuration < MIN_AUTO_DURATION) return "自动检测至少持续 15 分钟";
         if (requestedMode == AUTO && !supportsAuto()) return "手机缺少运动传感器，请使用倒计时";
         cancel(); mode = requestedMode; duration = requestedDuration; deadline = now() + duration;
         message = "";
