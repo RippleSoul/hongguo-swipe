@@ -30,7 +30,7 @@ def main():
         folder.mkdir()
     run(TOOLS / "aapt2", "compile", "--dir", ROOT / "res", "-o", BUILD / "resources.zip")
     run(TOOLS / "aapt2", "link", "-o", BUILD / "resources.apk", "--manifest", ROOT / "AndroidManifest.xml",
-        "-I", ANDROID, "--java", generated, "--version-code", "2", "--version-name", "0.2.0",
+        "-I", ANDROID, "--java", generated, "--version-code", "3", "--version-name", "0.3.0",
         "--min-sdk-version", "24", "--target-sdk-version", "33", BUILD / "resources.zip")
     sources = list((ROOT / "src").rglob("*.java")) + list(generated.rglob("*.java"))
     run(JDK / "bin/javac", "-J-Duser.language=en", "-J-Dfile.encoding=UTF-8", "-encoding", "UTF-8", "-source", "8", "-target", "8", "-Xlint:-options",
@@ -51,7 +51,7 @@ def main():
     if not key.exists():
         run(JDK / "bin/keytool", "-genkeypair", "-keystore", key, "-storepass", "android", "-keypass", "android",
             "-alias", "local", "-dname", "CN=Local Android Utility", "-keyalg", "RSA", "-validity", "10000")
-    output = ROOT / "红果上划助手.apk"
+    output = ROOT / "红果助手.apk"
     run(TOOLS / "apksigner", "sign", "--ks", key, "--ks-key-alias", "local", "--ks-pass", "pass:android",
         "--key-pass", "pass:android", "--out", output, aligned)
     run(TOOLS / "apksigner", "verify", "--verbose", output)

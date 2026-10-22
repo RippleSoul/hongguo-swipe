@@ -10,12 +10,14 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.graphics.Path;
 import android.graphics.Rect;
+import android.media.AudioManager;
 import android.os.Handler;
 import android.os.Build;
 import android.os.Looper;
 import android.os.PowerManager;
 import android.os.SystemClock;
 import android.util.Log;
+import android.view.KeyEvent;
 import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
 import android.view.accessibility.AccessibilityWindowInfo;
@@ -34,6 +36,7 @@ public class SwipeService extends AccessibilityService {
     private static final Pattern COUNTDOWN = Pattern.compile("(\\d{1,3})\\s*(?:秒|[sS])(?:后)?[^\\n]{0,16}(?:滑|继续|跳过)");
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final SkipGate gate = new SkipGate();
+    private SleepController sleep;
     private boolean running, gestureInFlight, wasTarget, wasAd, awaitingExit;
     private boolean monitoring, tickScheduled, receiverRegistered;
     private long pollCount, foregroundChecks;
@@ -54,7 +57,10 @@ public class SwipeService extends AccessibilityService {
     };
     private final BroadcastReceiver screenReceiver = new BroadcastReceiver() {
         @Override public void onReceive(Context context, Intent intent) {
-            if (Intent.ACTION_SCREEN_OFF.equals(intent.getAction())) stopMonitoring("SCREEN_OFF");
+            if (Intent.ACTION_SCREEN_OFF.equals(intent.getAction())) {
+                stopMonitoring("SCREEN_OFF");
+                if (sleep != null) sleep.setForeground(false);
+            }
             else queueForegroundCheck();
         }
     };
@@ -64,8 +70,11 @@ public class SwipeService extends AccessibilityService {
         current = this;
         AccessibilityServiceInfo info = getServiceInfo();
         info.packageNames = null;
-        info.eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED | AccessibilityEvent.TYPE_WINDOWS_CHANGED;
+        info.eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED | AccessibilityEvent.TYPE_WINDOWS_CHANGED
+                | AccessibilityEvent.TYPE_VIEW_CLICKED | AccessibilityEvent.TYPE_VIEW_LONG_CLICKED;
         setServiceInfo(info);
+        sleep = new SleepController(this, handler);
+        sleep.restore();
         running = getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(WANTED, false);
         Log.i(TAG, "CONNECTED running=" + running);
         IntentFilter filter = new IntentFilter();
@@ -85,26 +94,42 @@ public class SwipeService extends AccessibilityService {
         running = value; epoch++; gate.reset(); awaitingExit = false;
         getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(WANTED, value).apply();
         Log.i(TAG, value ? "START" : "PAUSE");
-        if (value) queueForegroundCheck();
-        else stopMonitoring("PAUSED");
+        if (!value) stopMonitoring("PAUSED");
+        queueForegroundCheck();
+    }
+
+    SleepController sleep() { return sleep; }
+
+    String startSleep(int mode, long duration) {
+        String error = sleep.start(mode, duration);
+        queueForegroundCheck();
+        return error;
     }
 
     private void queueForegroundCheck() {
         handler.removeCallbacks(reconcile);
-        if (running) handler.postDelayed(reconcile, 100);
+        if (running || (sleep != null && sleep.wantsForegroundEvents())) handler.postDelayed(reconcile, 100);
     }
 
     private void reconcileForeground() {
-        if (!running) { stopMonitoring("PAUSED"); return; }
+        if (!running && (sleep == null || !sleep.wantsForegroundEvents())) {
+            stopMonitoring("PAUSED"); return;
+        }
         PowerManager power = (PowerManager) getSystemService(POWER_SERVICE);
         KeyguardManager lock = (KeyguardManager) getSystemService(KEYGUARD_SERVICE);
-        if (!power.isInteractive() || lock.isKeyguardLocked()) { stopMonitoring("SCREEN_OR_LOCK"); return; }
+        if (!power.isInteractive() || lock.isKeyguardLocked()) {
+            stopMonitoring("SCREEN_OR_LOCK");
+            if (sleep != null) sleep.setForeground(false);
+            return;
+        }
         foregroundChecks++;
         AccessibilityNodeInfo root = getRootInActiveWindow();
         boolean target = false;
         try { target = root != null && isTargetRoot(root); }
         finally { if (root != null) root.recycle(); }
+        if (sleep != null) sleep.setForeground(target);
         if (!target) { stopMonitoring("NOT_FOREGROUND_OR_PIP"); return; }
+        if (!running) { stopMonitoring("PAUSED"); return; }
         if (!monitoring) {
             monitoring = true; gate.reset();
             Log.i(TAG, "MONITOR_START polls=" + pollCount);
@@ -140,11 +165,13 @@ public class SwipeService extends AccessibilityService {
         PowerManager power = (PowerManager) getSystemService(POWER_SERVICE);
         KeyguardManager lock = (KeyguardManager) getSystemService(KEYGUARD_SERVICE);
         if (!power.isInteractive() || lock.isKeyguardLocked()) {
+            if (sleep != null) sleep.setForeground(false);
             stopMonitoring("SCREEN_OR_LOCK"); return;
         }
         Snapshot screen = readScreen();
         long now = SystemClock.elapsedRealtime();
         if (!screen.target) {
+            if (sleep != null) sleep.setForeground(false);
             if (wasTarget) Log.i(TAG, "LEFT_TARGET");
             stopMonitoring("NOT_FOREGROUND_OR_PIP"); return;
         }
@@ -241,10 +268,74 @@ public class SwipeService extends AccessibilityService {
     private static String clean(CharSequence value) {
         return value == null ? "" : value.toString().replace("\u200b", "").trim();
     }
-    @Override public void onAccessibilityEvent(AccessibilityEvent event) { queueForegroundCheck(); }
-    @Override public void onInterrupt() { setRunning(false); }
+    private boolean targetIsForeground() {
+        AccessibilityNodeInfo root = getRootInActiveWindow();
+        try { return root != null && isTargetRoot(root); }
+        finally { if (root != null) root.recycle(); }
+    }
+
+    void checkAutomaticSleep() {
+        if (sleep == null) return;
+        PowerManager power = (PowerManager) getSystemService(POWER_SERVICE);
+        KeyguardManager lock = (KeyguardManager) getSystemService(KEYGUARD_SERVICE);
+        if (!power.isInteractive() || lock.isKeyguardLocked() || !targetIsForeground()) {
+            sleep.setForeground(false); return;
+        }
+        sleep.completeIfStillReady();
+    }
+
+    void finishForSleep(final int token) {
+        setRunning(false);
+        PowerManager power = (PowerManager) getSystemService(POWER_SERVICE);
+        if (!power.isInteractive()) { sleep.finished(token, true); return; }
+        if (targetIsForeground()) {
+            // A dedicated PAUSE key cannot toggle a paused player back on. Only send it while Hongguo is focused.
+            try {
+                AudioManager audio = (AudioManager) getSystemService(AUDIO_SERVICE);
+                audio.dispatchMediaKeyEvent(new KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_MEDIA_PAUSE));
+                audio.dispatchMediaKeyEvent(new KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_MEDIA_PAUSE));
+            } catch (RuntimeException failure) { Log.w("HGSleep", "MEDIA_PAUSE_FAILED", failure); }
+            // Leave the player before HOME to avoid triggering its automatic picture-in-picture mode.
+            global(GLOBAL_ACTION_BACK);
+        }
+        handler.postDelayed(new Runnable() {
+            @Override public void run() {
+                if (!sleep.validCompletion(token)) return;
+                if (targetIsForeground()) global(GLOBAL_ACTION_BACK);
+                handler.postDelayed(new Runnable() {
+                    @Override public void run() {
+                        if (!sleep.validCompletion(token)) return;
+                        if (targetIsForeground()) global(GLOBAL_ACTION_HOME);
+                        handler.postDelayed(new Runnable() {
+                            @Override public void run() {
+                                if (sleep.validCompletion(token)) sleep.finished(token,
+                                        Build.VERSION.SDK_INT >= 28 && global(GLOBAL_ACTION_LOCK_SCREEN));
+                            }
+                        }, 350);
+                    }
+                }, 400);
+            }
+        }, 400);
+    }
+
+    private boolean global(int action) {
+        try {
+            boolean accepted = performGlobalAction(action);
+            Log.i("HGSleep", "GLOBAL action=" + action + " accepted=" + accepted);
+            return accepted;
+        } catch (RuntimeException failure) { Log.w("HGSleep", "GLOBAL_FAILED action=" + action, failure); return false; }
+    }
+
+    @Override public void onAccessibilityEvent(AccessibilityEvent event) {
+        if (sleep != null && TARGET.contentEquals(event.getPackageName() == null ? "" : event.getPackageName())
+                && (event.getEventType() == AccessibilityEvent.TYPE_VIEW_CLICKED
+                || event.getEventType() == AccessibilityEvent.TYPE_VIEW_LONG_CLICKED)) sleep.userActivity();
+        queueForegroundCheck();
+    }
+    @Override public void onInterrupt() { setRunning(false); if (sleep != null) sleep.cancel(); }
     @Override public void onDestroy() {
         epoch++; running = false; handler.removeCallbacksAndMessages(null);
+        if (sleep != null) sleep.destroy();
         monitoring = false; tickScheduled = false;
         if (receiverRegistered) { unregisterReceiver(screenReceiver); receiverRegistered = false; }
         if (current == this) current = null;
@@ -254,6 +345,7 @@ public class SwipeService extends AccessibilityService {
         writer.println("HGSwipe running=" + running + " monitoring=" + monitoring
                 + " tickScheduled=" + tickScheduled + " polls=" + pollCount
                 + " foregroundChecks=" + foregroundChecks + " gestures=" + completedGestures);
+        if (sleep != null) writer.println("HGSleep " + sleep.diagnostics());
     }
     private static final class Snapshot {
         boolean target, ad, ready;

@@ -2,7 +2,7 @@
 <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
     android:description="@string/service_description"
     android:settingsActivity="cn.local.hongguoswipe.MainActivity"
-    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowsChanged"
+    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowsChanged|typeViewClicked|typeViewLongClicked"
     android:accessibilityFeedbackType="feedbackGeneric"
     android:notificationTimeout="200"
     android:canRetrieveWindowContent="true"

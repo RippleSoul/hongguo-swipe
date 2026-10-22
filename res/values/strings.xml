@@ -1,3 +1,4 @@
 <resources>
-    <string name="service_description">只在红果前台读取广告标记，等待后模拟上划。能读取到倒计时时等待倒计时结束，否则先等待再有限重试。回到助手点击“已开启”即可停止，也可在系统中关闭本服务。无联网和截图权限。</string>
+    <string name="service_description">只在红果前台读取广告标记，等待后模拟上划。回到首页点击“已开启”可停止上划。睡眠功能可倒计时，或根据手机持续少动推测入睡，结束播放并锁屏；可在睡眠页单独关闭。无联网、录音和截图权限。</string>
+    <color name="icon_background">#FAF5EC</color>
 </resources>
