@@ -24,6 +24,7 @@ import android.view.accessibility.AccessibilityWindowInfo;
 import java.io.FileDescriptor;
 import java.io.PrintWriter;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -36,11 +37,15 @@ public class SwipeService extends AccessibilityService {
     private static final Pattern COUNTDOWN = Pattern.compile("(\\d{1,3})\\s*(?:秒|[sS])(?:后)?[^\\n]{0,16}(?:滑|继续|跳过)");
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final SkipGate gate = new SkipGate();
+    private final SkipGate returnGate = new SkipGate();
+    private final GestureLease gesture = new GestureLease();
+    private final ArrayDeque<String> recentActions = new ArrayDeque<>();
     private SleepController sleep;
-    private boolean running, gestureInFlight, wasTarget, wasAd, awaitingExit;
-    private boolean monitoring, tickScheduled, receiverRegistered;
+    private boolean running, wasTarget, wasAd, wasReturn, awaitingExit;
+    private boolean monitoring, tickScheduled, receiverRegistered, reconcileScheduled;
     private long pollCount, foregroundChecks;
-    private int epoch, completedGestures;
+    private int epoch, completedGestures, transientRetries, interrupts, gestureTimeouts;
+    private String lastStop = "INITIAL", lastGestureKind = "none";
     private long lastGestureAt;
     private final Runnable ticker = new Runnable() {
         @Override public void run() {
@@ -48,12 +53,18 @@ public class SwipeService extends AccessibilityService {
             if (!monitoring || !running) return;
             pollCount++;
             try { tick(); }
-            catch (RuntimeException failure) { gate.reset(); Log.w(TAG, "POLL_FAILED", failure); }
+            catch (RuntimeException failure) { gate.reset(); returnGate.reset(); Log.w(TAG, "POLL_FAILED", failure); }
             if (monitoring && running) scheduleTick(400);
         }
     };
     private final Runnable reconcile = new Runnable() {
-        @Override public void run() { reconcileForeground(); }
+        @Override public void run() {
+            reconcileScheduled = false;
+            try { reconcileForeground(); }
+            catch (RuntimeException failure) {
+                Log.w(TAG, "FOREGROUND_FAILED", failure); retryTransientWindow();
+            }
+        }
     };
     private final BroadcastReceiver screenReceiver = new BroadcastReceiver() {
         @Override public void onReceive(Context context, Intent intent) {
@@ -72,10 +83,17 @@ public class SwipeService extends AccessibilityService {
         info.packageNames = null;
         info.eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED | AccessibilityEvent.TYPE_WINDOWS_CHANGED
                 | AccessibilityEvent.TYPE_VIEW_CLICKED | AccessibilityEvent.TYPE_VIEW_LONG_CLICKED;
+        info.flags |= AccessibilityServiceInfo.FLAG_INCLUDE_NOT_IMPORTANT_VIEWS;
         setServiceInfo(info);
+        handler.removeCallbacksAndMessages(null);
+        monitoring = tickScheduled = reconcileScheduled = false;
+        wasTarget = wasAd = wasReturn = awaitingExit = false;
+        epoch++; gesture.clear(); gate.reset(); returnGate.reset(); transientRetries = 0;
+        if (sleep != null) sleep.destroy();
         sleep = new SleepController(this, handler);
         sleep.restore();
         running = getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(WANTED, false);
+        trace("CONNECTED wanted=" + running);
         Log.i(TAG, "CONNECTED running=" + running);
         IntentFilter filter = new IntentFilter();
         filter.addAction(Intent.ACTION_SCREEN_OFF);
@@ -91,9 +109,11 @@ public class SwipeService extends AccessibilityService {
 
     public boolean isRunning() { return running; }
     public void setRunning(boolean value) {
-        running = value; epoch++; gate.reset(); awaitingExit = false;
+        running = value; epoch++; gesture.clear(); gate.reset(); returnGate.reset(); awaitingExit = false;
+        transientRetries = 0;
         getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(WANTED, value).apply();
         Log.i(TAG, value ? "START" : "PAUSE");
+        trace(value ? "START" : "PAUSE");
         if (!value) stopMonitoring("PAUSED");
         queueForegroundCheck();
     }
@@ -107,8 +127,17 @@ public class SwipeService extends AccessibilityService {
     }
 
     private void queueForegroundCheck() {
-        handler.removeCallbacks(reconcile);
-        if (running || (sleep != null && sleep.wantsForegroundEvents())) handler.postDelayed(reconcile, 100);
+        // Keep the earliest pending check: a stream of events must not postpone it forever.
+        if (reconcileScheduled || (!running && (sleep == null || !sleep.wantsForegroundEvents()))) return;
+        reconcileScheduled = true;
+        handler.postDelayed(reconcile, 100);
+    }
+
+    private void retryTransientWindow() {
+        if (transientRetries >= 5 || reconcileScheduled
+                || (!running && (sleep == null || !sleep.wantsForegroundEvents()))) return;
+        long delay = Math.min(2000, 200L << transientRetries++);
+        reconcileScheduled = true; handler.postDelayed(reconcile, delay);
     }
 
     private void reconcileForeground() {
@@ -125,13 +154,22 @@ public class SwipeService extends AccessibilityService {
         foregroundChecks++;
         AccessibilityNodeInfo root = getRootInActiveWindow();
         boolean target = false;
+        boolean transientWindow = root == null;
+        if (root != null && TARGET.contentEquals(root.getPackageName() == null ? "" : root.getPackageName()))
+            transientWindow = true;
         try { target = root != null && isTargetRoot(root); }
         finally { if (root != null) root.recycle(); }
         if (sleep != null) sleep.setForeground(target);
-        if (!target) { stopMonitoring("NOT_FOREGROUND_OR_PIP"); return; }
+        if (!target) {
+            stopMonitoring("NOT_FOREGROUND_OR_PIP");
+            if (transientWindow) retryTransientWindow();
+            else transientRetries = 0;
+            return;
+        }
+        transientRetries = 0;
         if (!running) { stopMonitoring("PAUSED"); return; }
         if (!monitoring) {
-            monitoring = true; gate.reset();
+            monitoring = true; gate.reset(); returnGate.reset();
             Log.i(TAG, "MONITOR_START polls=" + pollCount);
             scheduleTick(0);
         }
@@ -144,10 +182,13 @@ public class SwipeService extends AccessibilityService {
     }
 
     private void stopMonitoring(String reason) {
+        if (monitoring || !reason.equals(lastStop)) trace("STOP " + reason);
+        lastStop = reason;
         if (monitoring) { epoch++; Log.i(TAG, "MONITOR_STOP reason=" + reason + " polls=" + pollCount); }
+        gesture.clear();
         monitoring = false; tickScheduled = false;
         handler.removeCallbacks(ticker);
-        wasTarget = false; wasAd = false; awaitingExit = false; gate.reset();
+        wasTarget = false; wasAd = false; wasReturn = false; awaitingExit = false; gate.reset(); returnGate.reset();
     }
 
     private boolean isTargetRoot(AccessibilityNodeInfo root) {
@@ -173,24 +214,34 @@ public class SwipeService extends AccessibilityService {
         if (!screen.target) {
             if (sleep != null) sleep.setForeground(false);
             if (wasTarget) Log.i(TAG, "LEFT_TARGET");
-            stopMonitoring("NOT_FOREGROUND_OR_PIP"); return;
+            stopMonitoring("NOT_FOREGROUND_OR_PIP");
+            queueForegroundCheck(); return;
         }
         if (!wasTarget) Log.i(TAG, "TARGET bounds=" + screen.bounds.toShortString());
         wasTarget = true;
         if (screen.ad && !wasAd) Log.i(TAG, "AD_ENTER bounds=" + screen.badge.toShortString());
         if (!screen.ad && wasAd) Log.i(TAG, "AD_ABSENT");
         wasAd = screen.ad;
-        if (!screen.ad && awaitingExit) {
-            Log.i(TAG, "AD_EXIT_AFTER_GESTURE delayMs=" + (now - lastGestureAt));
+        if (screen.continuation && !wasReturn) {
+            Log.i(TAG, "RETURN_PROMPT source=" + screen.promptSource);
+            trace("RETURN_PROMPT " + screen.promptSource);
+        }
+        wasReturn = screen.continuation;
+        if (!screen.ad && !screen.continuation && awaitingExit) {
+            Log.i(TAG, "PAGE_EXIT_AFTER_GESTURE kind=" + lastGestureKind + " delayMs=" + (now - lastGestureAt));
+            trace("PAGE_EXIT " + lastGestureKind);
             awaitingExit = false;
         }
-        boolean shouldSwipe = gate.observe(now, screen.ad, screen.ready, screen.countdown);
-        if (screen.ad && shouldSwipe && !gestureInFlight) swipe(screen);
+        if (gesture.expire(now)) { gestureTimeouts++; trace("GESTURE_TIMEOUT_RECOVERED"); Log.w(TAG, "GESTURE_TIMEOUT_RECOVERED"); }
+        boolean adSwipe = gate.observe(now, screen.ad, screen.ready, screen.countdown);
+        boolean returnSwipe = returnGate.observe(now, !screen.ad && screen.continuation, true, screen.countdown);
+        if ((adSwipe || returnSwipe) && !gesture.pending()) swipe(screen);
     }
 
     private void swipe(Snapshot previous) {
         Snapshot screen = readScreen();
-        if (!running || !screen.target || !screen.ad || !screen.bounds.equals(previous.bounds)) return;
+        boolean sameKind = previous.ad ? screen.ad : !screen.ad && screen.continuation;
+        if (!running || !screen.target || !sameKind || !screen.bounds.equals(previous.bounds)) return;
         PowerManager power = (PowerManager) getSystemService(POWER_SERVICE);
         KeyguardManager lock = (KeyguardManager) getSystemService(KEYGUARD_SERVICE);
         if (!power.isInteractive() || lock.isKeyguardLocked()) return;
@@ -201,24 +252,30 @@ public class SwipeService extends AccessibilityService {
         Path path = new Path();
         path.moveTo(x, b.top + b.height() * .66f);
         path.lineTo(x, b.top + b.height() * .22f);
-        GestureDescription gesture = new GestureDescription.Builder()
+        GestureDescription request = new GestureDescription.Builder()
                 .addStroke(new GestureDescription.StrokeDescription(path, 0, 420)).build();
-        gate.attempted(SystemClock.elapsedRealtime());
-        gestureInFlight = true;
-        boolean accepted = dispatchGesture(gesture, new GestureResultCallback() {
+        final SkipGate selectedGate = screen.ad ? gate : returnGate;
+        final String kind = screen.ad ? "ad" : screen.promptSource;
+        selectedGate.attempted(SystemClock.elapsedRealtime());
+        final long token = gesture.begin(SystemClock.elapsedRealtime());
+        boolean accepted;
+        try { accepted = dispatchGesture(request, new GestureResultCallback() {
             @Override public void onCompleted(GestureDescription description) {
-                gestureInFlight = false;
+                if (!gesture.finish(token)) return;
                 if (!running || requestEpoch != epoch) return;
                 completedGestures++;
-                lastGestureAt = SystemClock.elapsedRealtime(); awaitingExit = true;
-                Log.i(TAG, "GESTURE_COMPLETED total=" + completedGestures);
+                trace("COMPLETED " + kind + " token=" + token);
+                lastGestureAt = SystemClock.elapsedRealtime(); lastGestureKind = kind; awaitingExit = true;
+                Log.i(TAG, "GESTURE_COMPLETED total=" + completedGestures + " kind=" + kind);
             }
             @Override public void onCancelled(GestureDescription description) {
-                gestureInFlight = false; Log.i(TAG, "GESTURE_CANCELLED");
+                if (gesture.finish(token)) { trace("CANCELLED " + kind + " token=" + token); Log.i(TAG, "GESTURE_CANCELLED"); }
             }
-        }, handler);
-        if (!accepted) gestureInFlight = false;
-        Log.i(TAG, "SWIPE_REQUEST accepted=" + accepted + " attempt=" + gate.attempts()
+        }, handler); }
+        catch (RuntimeException failure) { gesture.finish(token); trace("REQUEST_FAILED " + kind); Log.w(TAG, "GESTURE_REQUEST_FAILED", failure); return; }
+        if (!accepted) gesture.finish(token);
+        trace("REQUEST " + kind + " accepted=" + accepted + " token=" + token);
+        Log.i(TAG, "SWIPE_REQUEST accepted=" + accepted + " attempt=" + selectedGate.attempts() + " kind=" + kind
                 + " bounds=" + b.toShortString());
     }
 
@@ -232,6 +289,7 @@ public class SwipeService extends AccessibilityService {
         snapshot.target = true;
         root.getBoundsInScreen(snapshot.bounds);
         ArrayDeque<AccessibilityNodeInfo> queue = new ArrayDeque<>(); queue.add(root);
+        ArrayList<Rect> images = new ArrayList<>();
         int visited = 0;
         try {
             while (!queue.isEmpty() && visited++ < 900) {
@@ -251,6 +309,18 @@ public class SwipeService extends AccessibilityService {
                         snapshot.ad = true; snapshot.badge.set(bounds);
                     }
                     String label = text + " " + desc;
+                    if ((ReturnPrompt.text(text) || ReturnPrompt.text(desc)) && bounds.height() > 0
+                            && bounds.height() < screen.height() * .15
+                            && bounds.centerY() > screen.top + screen.height() * .70) {
+                        snapshot.continuation = true; snapshot.promptSource = "return_text";
+                    }
+                    String id = clean(node.getViewIdResourceName());
+                    if ((TARGET + ":id/ttlive_player_render_view").equals(id)
+                            && "android.view.TextureView".contentEquals(node.getClassName() == null ? "" : node.getClassName()))
+                        snapshot.liveVideo.set(bounds);
+                    if (id.isEmpty() && text.isEmpty() && desc.isEmpty() && images.size() < 32
+                            && "android.widget.ImageView".contentEquals(node.getClassName() == null ? "" : node.getClassName()))
+                        images.add(new Rect(bounds));
                     if (label.contains("上滑继续观看") || label.contains("上滑跳过")
                             || label.contains("上滑继续看") || label.contains("滑动跳过广告")) snapshot.ready = true;
                     Matcher countdown = COUNTDOWN.matcher(label);
@@ -262,6 +332,15 @@ public class SwipeService extends AccessibilityService {
                 } finally { node.recycle(); }
             }
         } finally { while (!queue.isEmpty()) queue.removeFirst().recycle(); }
+        if (!snapshot.continuation && !snapshot.liveVideo.isEmpty()) {
+            Rect s = snapshot.bounds, v = snapshot.liveVideo;
+            for (Rect a : images) {
+                if (ReturnPrompt.liveBar(s.width(), s.height(), v.left-s.left, v.top-s.top,
+                        v.right-s.left, v.bottom-s.top, a.left-s.left, a.top-s.top, a.right-s.left, a.bottom-s.top)) {
+                    snapshot.continuation = true; snapshot.promptSource = "live_return_bar"; break;
+                }
+            }
+        }
         return snapshot;
     }
 
@@ -327,16 +406,23 @@ public class SwipeService extends AccessibilityService {
     }
 
     @Override public void onAccessibilityEvent(AccessibilityEvent event) {
+        if (!monitoring && (event.getEventType() == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+                || event.getEventType() == AccessibilityEvent.TYPE_WINDOWS_CHANGED)) transientRetries = 0;
         if (sleep != null && TARGET.contentEquals(event.getPackageName() == null ? "" : event.getPackageName())
                 && (event.getEventType() == AccessibilityEvent.TYPE_VIEW_CLICKED
                 || event.getEventType() == AccessibilityEvent.TYPE_VIEW_LONG_CLICKED)) sleep.userActivity();
         queueForegroundCheck();
     }
-    @Override public void onInterrupt() { setRunning(false); if (sleep != null) sleep.cancel(); }
+    @Override public void onInterrupt() {
+        trace("INTERRUPT wanted=" + running);
+        interrupts++; stopMonitoring("INTERRUPTED"); transientRetries = 0;
+        // An interrupt asks to stop current feedback. It is not the user's off switch.
+        queueForegroundCheck();
+    }
     @Override public void onDestroy() {
-        epoch++; running = false; handler.removeCallbacksAndMessages(null);
+        epoch++; running = false; gesture.clear(); handler.removeCallbacksAndMessages(null);
         if (sleep != null) sleep.destroy();
-        monitoring = false; tickScheduled = false;
+        monitoring = false; tickScheduled = false; reconcileScheduled = false;
         if (receiverRegistered) { unregisterReceiver(screenReceiver); receiverRegistered = false; }
         if (current == this) current = null;
         super.onDestroy();
@@ -344,12 +430,25 @@ public class SwipeService extends AccessibilityService {
     @Override protected void dump(FileDescriptor fd, PrintWriter writer, String[] args) {
         writer.println("HGSwipe running=" + running + " monitoring=" + monitoring
                 + " tickScheduled=" + tickScheduled + " polls=" + pollCount
-                + " foregroundChecks=" + foregroundChecks + " gestures=" + completedGestures);
+                + " foregroundChecks=" + foregroundChecks + " gestures=" + completedGestures
+                + " interrupts=" + interrupts + " gestureTimeouts=" + gestureTimeouts + " lastStop=" + lastStop
+                + " lastGestureKind=" + lastGestureKind);
+        try {
+            Snapshot s = readScreen();
+            writer.println("HGPage target=" + s.target + " ad=" + s.ad + " return=" + s.continuation
+                    + " source=" + s.promptSource + " countdown=" + s.countdown + " gesturePending=" + gesture.pending());
+        } catch (RuntimeException failure) { writer.println("HGPage temporarily unavailable"); }
         if (sleep != null) writer.println("HGSleep " + sleep.diagnostics());
+        for (String action : recentActions) writer.println("HGTrace " + action);
+    }
+    private void trace(String action) {
+        if (recentActions.size() >= 12) recentActions.removeFirst();
+        recentActions.addLast(SystemClock.elapsedRealtime() + " " + action);
     }
     private static final class Snapshot {
-        boolean target, ad, ready;
+        boolean target, ad, ready, continuation;
+        String promptSource = "none";
         int countdown;
-        final Rect bounds = new Rect(), badge = new Rect();
+        final Rect bounds = new Rect(), badge = new Rect(), liveVideo = new Rect();
     }
 }

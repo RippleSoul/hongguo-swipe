@@ -30,7 +30,7 @@ def main():
         folder.mkdir()
     run(TOOLS / "aapt2", "compile", "--dir", ROOT / "res", "-o", BUILD / "resources.zip")
     run(TOOLS / "aapt2", "link", "-o", BUILD / "resources.apk", "--manifest", ROOT / "AndroidManifest.xml",
-        "-I", ANDROID, "--java", generated, "--version-code", "3", "--version-name", "0.3.0",
+        "-I", ANDROID, "--java", generated, "--version-code", "4", "--version-name", "0.3.1",
         "--min-sdk-version", "24", "--target-sdk-version", "33", BUILD / "resources.zip")
     sources = list((ROOT / "src").rglob("*.java")) + list(generated.rglob("*.java"))
     run(JDK / "bin/javac", "-J-Duser.language=en", "-J-Dfile.encoding=UTF-8", "-encoding", "UTF-8", "-source", "8", "-target", "8", "-Xlint:-options",

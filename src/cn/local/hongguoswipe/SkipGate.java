@@ -1,6 +1,6 @@
 package cn.local.hongguoswipe;
 
-/** No video timer: the ad badge must remain present before every attempt. */
+/** No video timer: positive page evidence must remain present before every attempt. */
 public final class SkipGate {
     private long seenAt = -1;
     private long absentAt = -1;
@@ -16,8 +16,8 @@ public final class SkipGate {
         blockedUntil = 0;
     }
 
-    public boolean observe(long now, boolean ad, boolean ready, int countdownSeconds) {
-        if (!ad) {
+    public boolean observe(long now, boolean eligible, boolean ready, int countdownSeconds) {
+        if (!eligible) {
             readyFrames = 0;
             lastReady = -1;
             if (absentAt < 0) absentAt = now;
